@@ -1,0 +1,53 @@
+on:
+  push:
+    tags: ["v*"]
+
+name: release
+
+jobs:
+
+  kbld-publish:
+    name: Release
+    runs-on: ubuntu-latest
+
+    # https://docs.github.com/en/actions/reference/authentication-in-a-workflow
+    permissions:
+      id-token: write  # undocumented OIDC support.
+      packages: write
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-go@v2
+        with:
+          go-version: 1.17
+      - name: setup ko
+        run: go install github.com/google/ko@main
+      - uses: sigstore/cosign-installer@main
+      - name: login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $(echo ${{ github.actor }} | awk '{print tolower($0)}') --password-stdin
+      - name: install carvel
+        run: curl -L https://carvel.dev/install.sh | bash
+      - name: build and sign image
+        run: |
+          set -e -x
+          export COSIGN_EXPERIMENTAL=1
+          kbld -f kbuild.yml --imgpkg-lock-output ./images.yml > ./config.yml
+          cat config.yml | yq eval '.spec.containers[0].image' - | xargs -n1 cosign sign -a git_sha=$GITHUB_SHA
+      - name: sign config and images yaml
+        run: |
+          set -e -x
+          export COSIGN_EXPERIMENTAL=1
+          cosign sign-blob --output config.sig config.yml 2>&1 | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' > config.crt
+          cosign sign-blob --output images.sig images.yml 2>&1 | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' > images.crt
+      - name: Create Release
+        run: |
+          set -x
+          assets=()
+          for asset in ./config.{yml,sig,crt} ./images.{yml,sig,crt}; do
+            assets+=("-a" "$asset")
+          done
+          tag_name="${GITHUB_REF##*/}"
+          hub release create "${assets[@]}" -m "$tag_name" "$tag_name"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
